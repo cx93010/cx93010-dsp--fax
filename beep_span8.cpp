@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <cstdlib>
+#include <cctype>
 
 extern "C" {
 #include <spandsp.h>
@@ -82,6 +83,17 @@ bool is_tiff(const std::string &path) {
     return (ext == "tif" || ext == "tiff");
 }
 
+// Quote one shell argument; paths supplied by the user may contain spaces or quotes.
+std::string shell_quote(const std::string &arg) {
+    std::string quoted = "'";
+    for (char c : arg) {
+        if (c == '\'') quoted += "'\\''";
+        else quoted += c;
+    }
+    quoted += "'";
+    return quoted;
+}
+
 std::string page_size_to_gs(const std::string &size) {
     std::string s;
     for (auto c : size) s.push_back((char)tolower((unsigned char)c));
@@ -96,33 +108,39 @@ std::string prepare_fax_file(const std::string &input_file,
                              bool low_res,
                              bool medium_res,
                              const std::string &page_size,
-                             bool allow_oversize)
+                             bool allow_oversize,
+                             bool color)
 {
     if (!is_pdf(input_file))
         return input_file;
 
-    std::string tmp_file = "/tmp/fax_convert_out.tif";
-    std::cout << "[Converter] PDF detected. Converting to G4 TIFF via Ghostscript...\n";
+    const std::string tmp_file = "/tmp/fax_convert_" + std::to_string((long)getpid()) +
+                                 (color ? "_color.tif" : "_bw.tif");
+    const std::string device = color ? "tiff24nc" : "tiffg4";
+    std::cout << "[Converter] PDF detected. Converting to "
+              << (color ? "24-bit RGB color TIFF" : "G4 monochrome TIFF")
+              << " via Ghostscript...\n";
 
-    std::string gs_page = page_size_to_gs(page_size.empty() ? "a4" : page_size);
-    std::string res = "204x196";
-    if (low_res) res = "204x98";
+    const std::string gs_page = page_size_to_gs(page_size.empty() ? "a4" : page_size);
+    // Color fax uses symmetric resolutions. -l selects 100x100; default/-m selects 200x200.
+    const std::string res = color ? (low_res ? "100" : "200")
+                                  : (low_res ? "204x98" : "204x196");
 
-    std::string cmd = "gs -q -dNOPAUSE -dBATCH -sDEVICE=tiffg4 ";
-    cmd += "-sPAPERSIZE=" + gs_page + " ";
-    cmd += "-r" + res + " ";
-    if (allow_oversize) {
+    std::string cmd = "gs -q -dNOPAUSE -dBATCH -sDEVICE=" + device + " ";
+    cmd += "-sPAPERSIZE=" + gs_page + " -r" + res + " ";
+    if (allow_oversize)
         cmd += "-dFIXEDMEDIA -dPDFFitPage ";
-    }
-    cmd += "-sOutputFile=" + tmp_file + " " + input_file + " 2>/dev/null";
+    cmd += "-sOutputFile=" + shell_quote(tmp_file) + " " + shell_quote(input_file) +
+           " >/dev/null 2>&1";
 
     if (system(cmd.c_str()) == 0) {
         std::cout << "[Converter] Success: " << tmp_file << " created.\n";
         return tmp_file;
-    } else {
-        std::cerr << "[Converter] Error: Ghostscript failed.\n";
-        return "";
     }
+
+    std::cerr << "[Converter] Error: Ghostscript failed.\n";
+    unlink(tmp_file.c_str());
+    return "";
 }
 
 bool send_cmd(int fd, const char* cmd, const char* expect="OK", int timeout_ms=3000) {
@@ -149,7 +167,7 @@ bool send_cmd(int fd, const char* cmd, const char* expect="OK", int timeout_ms=3
         elapsed += 50;
     }
 
-    return false;   // (Removed the "got: goo" debug line)
+    return false;
 }
 
 void print_help(const char *prog) {
@@ -162,8 +180,9 @@ void print_help(const char *prog) {
         << "  -E              Disable ECM\n"
         << "  -B <speed>      Max fax speed\n"
         << "  -s <size>       Page size: a4, letter, legal, a3\n"
-        << "  -l              Low resolution (204x98)\n"
-        << "  -m              Medium/Fine resolution (204x196)\n"
+        << "  -l              Low resolution (BW 204x98; color 100x100)\n"
+        << "  -m              Medium/Fine resolution (BW 204x196; color 200x200)\n"
+        << "  -c              Enable color fax (T.42/JPEG); PDF input rendered as RGB TIFF\n"
         << "  -G              Allow oversized pages\n"
         << "  -h, --help      Show help\n";
 }
@@ -173,6 +192,7 @@ int main(int argc, char *argv[]) {
     std::string user_ident = "FAX";
     bool use_ecm = true;
     bool polling = false;
+    bool color = false;
     int max_speed = 14400;
     std::string page_size = "a4";
     bool low_res = false;
@@ -184,7 +204,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--help") == 0) { print_help(argv[0]); return 0; }
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:u:EB:Ps:lmGh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:u:EB:Ps:lmGch")) != -1) {
         switch (opt) {
             case 'd': dial_num = optarg; break;
             case 'u': user_ident = optarg; break;
@@ -195,6 +215,7 @@ int main(int argc, char *argv[]) {
             case 'l': low_res = true; medium_res = false; break;
             case 'm': medium_res = true; low_res = false; break;
             case 'G': allow_oversize = true; break;
+            case 'c': color = true; break;
             case 'h': print_help(argv[0]); return 0;
             default: print_help(argv[0]); return 1;
         }
@@ -202,6 +223,11 @@ int main(int argc, char *argv[]) {
 
     if (dial_num.empty()) {
         std::cerr << "Error: -d <num> is required.\n";
+        return 1;
+    }
+
+    if (color && polling) {
+        std::cerr << "Error: -c is for color sending and cannot be combined with -P.\n";
         return 1;
     }
 
@@ -223,6 +249,10 @@ int main(int argc, char *argv[]) {
     }
 
     fax_state_t *fax_obj = fax_init(NULL, true);
+    if (!fax_obj) {
+        std::cerr << "Error: SpanDSP fax initialization failed.\n";
+        return 1;
+    }
     t30_state_t *t30_obj = fax_get_t30_state(fax_obj);
 
     logging_state_t *logging = t30_get_logging_state(t30_obj);
@@ -230,12 +260,40 @@ int main(int argc, char *argv[]) {
     span_log_set_level(logging, SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_PROTOCOL | SPAN_LOG_FLOW);
 
     t30_set_supported_modems(t30_obj, T30_SUPPORT_V27TER | T30_SUPPORT_V29 | T30_SUPPORT_V17);
-    t30_set_supported_compressions(t30_obj, 0x01 | 0x02 | 0x04);
 
-    int res_mask = low_res ? T4_RESOLUTION_R8_STANDARD : T4_RESOLUTION_R8_FINE;
-    int width_mask = T4_SUPPORT_WIDTH_215MM;
-    int image_caps = width_mask | res_mask | T4_SUPPORT_LENGTH_UNLIMITED;
+    int compression_caps = T4_COMPRESSION_T4_1D | T4_COMPRESSION_T4_2D;
+    if (color) {
+        // Keep monochrome modes available and permit SpanDSP's color-to-bilevel fallback.
+        compression_caps |= T4_COMPRESSION_T6
+                         | T4_COMPRESSION_T42_T81
+                         | T4_COMPRESSION_COLOUR
+                         | T4_COMPRESSION_COLOUR_TO_BILEVEL
+                         | T4_COMPRESSION_RESCALING;
+    }
+    t30_set_supported_compressions(t30_obj, compression_caps);
+
+    int width_mask = (page_size == "a3" || page_size == "A3")
+                   ? T4_SUPPORT_WIDTH_303MM : T4_SUPPORT_WIDTH_215MM;
+    int image_caps = width_mask | T4_SUPPORT_LENGTH_UNLIMITED;
     t30_set_supported_image_sizes(t30_obj, image_caps);
+
+    // Keep bilevel resolution capabilities separate from the page-size mask.
+    int bilevel_resolutions = low_res ? T4_RESOLUTION_R8_STANDARD : T4_RESOLUTION_R8_FINE;
+    t30_set_supported_bilevel_resolutions(t30_obj, bilevel_resolutions);
+
+    if (color) {
+        // Advertise a range; T.30 negotiates the common capability with the far end.
+        // SpanDSP's color page modes use symmetric resolutions.
+        int color_resolutions = T4_RESOLUTION_100_100
+                              | T4_RESOLUTION_200_200
+                              | T4_RESOLUTION_300_300
+                              | T4_RESOLUTION_400_400
+                              | T4_RESOLUTION_600_600
+                              | T4_RESOLUTION_1200_1200;
+        t30_set_supported_colour_resolutions(t30_obj, color_resolutions);
+    } else {
+        t30_set_supported_colour_resolutions(t30_obj, 0);
+    }
 
     t30_set_ecm_capability(t30_obj, use_ecm);
     t30_set_phase_e_handler(t30_obj, phase_e_handler, NULL);
@@ -247,14 +305,23 @@ int main(int argc, char *argv[]) {
     if (polling) {
         t30_set_rx_file(t30_obj, "polled_fax.tif", -1);
     } else {
-        std::string final_path = prepare_fax_file(input_path, low_res, medium_res, page_size, allow_oversize);
-        if (final_path.empty()) return 1;
+        std::string final_path = prepare_fax_file(input_path, low_res, medium_res,
+                                                  page_size, allow_oversize, color);
+        if (final_path.empty()) {
+            fax_release(fax_obj);
+            return 1;
+        }
         if (final_path != input_path) temp_tif_path = final_path;
         t30_set_tx_file(t30_obj, final_path.c_str(), -1, -1);
     }
 
     int fd = open("/dev/ttyACM0", O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0) { perror("Open /dev/ttyACM0"); return 1; }
+    if (fd < 0) {
+        perror("Open /dev/ttyACM0");
+        fax_release(fax_obj);
+        if (!temp_tif_path.empty()) unlink(temp_tif_path.c_str());
+        return 1;
+    }
 
     struct termios tty{};
     tcgetattr(fd, &tty);
@@ -274,6 +341,9 @@ int main(int argc, char *argv[]) {
 
     if (!send_cmd(fd, "AT+VTR\r", "CONNECT", 5000)) {
         std::cerr << "Voice mode failed.\n";
+        close(fd);
+        fax_release(fax_obj);
+        if (!temp_tif_path.empty()) unlink(temp_tif_path.c_str());
         return 1;
     }
 
