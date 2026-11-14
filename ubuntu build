@@ -1,0 +1,11 @@
+## Build
+Requires `libspandsp-dev` (and `ghostscript` for PDF inputs):
+
+```bash
+g++ beep_span8.cpp -o beep_span8 -lspandsp -ltiff -lm
+```
+
+## Usage
+```bash
+./beep_span8 -d <phone_number> <file.pdf|file.tif>
+```
